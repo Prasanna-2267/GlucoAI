@@ -1,16 +1,19 @@
 import os
 import pickle
 import numpy as np
+import json
 import re
+import uuid
 from typing import Optional, Dict
 from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import pytesseract
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+from fastapi.middleware.cors import CORSMiddleware
 
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
@@ -19,6 +22,15 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 
+from sqlalchemy import create_engine, Column, String, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+
+from models import DiabetesRecord
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 # --------------------------------------------------
 # Load Environment Variables
 # --------------------------------------------------
@@ -35,6 +47,17 @@ app = FastAPI(
     title="Diabetes AI Chatbot API",
     version="1.0.0",
     description="Gemini + LangChain based diabetes-only chatbot"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5500",
+        "http://127.0.0.1:5500"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --------------------------------------------------
@@ -184,6 +207,7 @@ def run_ocr(file: UploadFile) -> dict:
 
 class DetectRequest(BaseModel):
     age: int
+    user_id: str 
 
     glucose: Optional[float] = None
     blood_pressure: Optional[float] = None
@@ -215,7 +239,7 @@ class DetectResponse(BaseModel):
 @app.post("/model-upload", response_model=DetectResponse)
 async def detect_from_report_with_model(
     file: UploadFile = File(...),
-
+    user_id: str = Form(...), 
     # User-provided fallback values
     age: Optional[int] = None,
     blood_pressure: Optional[float] = None,
@@ -226,6 +250,7 @@ async def detect_from_report_with_model(
     """
     Upload report -> OCR -> ask user if critical fields missing -> model prediction
     """
+    db = SessionLocal()
 
     # 1️⃣ OCR extraction
     extracted = run_ocr(file)
@@ -284,6 +309,21 @@ async def detect_from_report_with_model(
     # 7️⃣ Scale + Predict
     X_scaled = scaler.transform(X)
     prob = model.predict_proba(X_scaled)[0][1]
+    prediction = "diabetic" if prob >= 0.5 else "non-diabetic"
+
+    record = DiabetesRecord(
+        user_id=uuid.UUID(user_id),
+            glucose=final_data["glucose"],
+            blood_pressure=final_data["blood_pressure"],
+            skin_thickness=final_data["skin_thickness"],
+            insulin=final_data["insulin"],
+            bmi=final_data["bmi"],
+            age=final_data["age"],
+            prediction=prediction,
+            probability=float(prob)
+        )
+    db.add(record)
+    db.commit()
 
     # 8️⃣ Return result
     return DetectResponse(
@@ -298,6 +338,7 @@ async def detect_from_report_with_model(
 # -------------------------------------------------
 @app.post("/detect/manual", response_model=DetectResponse)
 def detect_manual(req: DetectRequest):
+    db = SessionLocal()
     data = {
         "glucose": req.glucose,
         "blood_pressure": req.blood_pressure,
@@ -332,9 +373,261 @@ def detect_manual(req: DetectRequest):
 
     X_scaled = scaler.transform(X)
     prob = model.predict_proba(X_scaled)[0][1]
+    prediction = "diabetic" if prob >= 0.5 else "non-diabetic"
+
+    record = DiabetesRecord(
+        user_id=uuid.UUID(req.user_id),
+            glucose=final_data["glucose"],
+            blood_pressure=final_data["blood_pressure"],
+            skin_thickness=final_data["skin_thickness"],
+            insulin=final_data["insulin"],
+            bmi=final_data["bmi"],
+            age=final_data["age"],
+            prediction=prediction,
+            probability=float(prob)
+        )
+    db.add(record)
+    db.commit()
 
     return DetectResponse(
         prediction="Diabetic" if prob >= 0.5 else "Non-Diabetic",
         probability=round(float(prob), 4),
         values_used=final_data
     )
+
+# --------------- GOOGLE AUTHENTICATION -------------------
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not GOOGLE_CLIENT_ID:
+    raise RuntimeError("GOOGLE_CLIENT_ID not set")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
+
+# --------------------------------------------------
+# DATABASE SETUP
+# --------------------------------------------------
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# --------------------------------------------------
+# USER MODEL
+# --------------------------------------------------
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, nullable=False)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# --------------------------------------------------
+# AUTO CREATE TABLES
+# --------------------------------------------------
+Base.metadata.create_all(bind=engine)
+
+
+
+# --------------------------------------------------
+# REQUEST / RESPONSE SCHEMAS
+# --------------------------------------------------
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+class GoogleAuthResponse(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    is_new_user: bool
+
+# --------------------------------------------------
+# GOOGLE AUTH ENDPOINT
+# --------------------------------------------------
+@app.post("/auth/google", response_model=GoogleAuthResponse)
+def google_auth(request: GoogleAuthRequest):
+    try:
+        # 1️⃣ Verify Google ID Token
+        idinfo = id_token.verify_oauth2_token(
+            request.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+
+        email = idinfo.get("email")
+        name = idinfo.get("name")
+
+        if not email or not name:
+            raise HTTPException(status_code=400, detail="Invalid Google token")
+
+        db = SessionLocal()
+
+        # 2️⃣ Check if user exists
+        user = db.query(User).filter(User.email == email).first()
+
+        if user:
+            return GoogleAuthResponse(
+                user_id=str(user.id),
+                email=user.email,
+                name=user.name,
+                is_new_user=False
+            )
+
+        # 3️⃣ Create new user
+        new_user = User(
+            id=uuid.uuid4(),
+            email=email,
+            name=name
+        )
+
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        return GoogleAuthResponse(
+            user_id=str(new_user.id),
+            email=new_user.email,
+            name=new_user.name,
+            is_new_user=True
+        )
+
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired Google token")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+# --------------------------------------------------
+# PREDICT ENDPOINT
+# --------------------------------------------------
+
+class PredictRiskRequest(BaseModel):
+    user_id: str
+
+    # Only required if NO history exists
+    glucose_30_days_ago: Optional[float] = None
+    glucose_60_days_ago: Optional[float] = None
+    glucose_90_days_ago: Optional[float] = None
+
+    # Lifestyle questions (answers as text)
+    lifestyle_answers: Dict[str, str]
+
+class PredictRiskResponse(BaseModel):
+    risk_trend: str          # Improving / Stable / Worsening
+    confidence: str          # Low / Medium / High
+    reasoning: list[str]
+    future_outlook: list[str]
+    note: str
+
+RISK_PREDICTION_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+You are an AI assistant performing diabetes RISK TREND ESTIMATION.
+
+STRICT RULES:
+- This is NOT a medical diagnosis.
+- Do NOT predict glucose numbers.
+- Do NOT suggest medications.
+- Output must be qualitative only.
+
+You must classify risk trend as one of:
+- Improving
+- Stable
+- Worsening
+
+You must also provide:
+- confidence: Low / Medium / High
+- reasoning: 3-4 bullet points
+- future_outlook: EXACTLY 3 bullet points
+
+Field meanings (STRICT):
+- reasoning:
+  Explain WHY this risk trend was assigned based on patterns, history, and lifestyle.
+- future_outlook:
+  Explain WHAT MAY HAPPEN if the user continues the same lifestyle without changes.
+  (Do NOT give medical advice, numbers, or treatments.)
+
+If historical data is limited, confidence MUST be Low.
+
+Return ONLY valid JSON in this exact format:
+{{
+  "risk_trend": "",
+  "confidence": "",
+  "reasoning": [],
+  "future_outlook": []
+}}
+
+Do NOT include explanations, markdown, or text outside JSON.
+        """
+    ),
+    ("human", "{input_data}")
+])
+
+
+
+def get_user_detection_history(user_id: str):
+    db = SessionLocal()
+    records = (
+        db.query(DiabetesRecord)
+        .filter(DiabetesRecord.user_id == uuid.UUID(user_id))
+        .order_by(DiabetesRecord.created_at)
+        .all()
+    )
+    db.close()
+
+    return [
+        {
+            "date": r.created_at.isoformat(),
+            "glucose": r.glucose,
+            "bmi": r.bmi,
+            "prediction": r.prediction
+        }
+        for r in records
+    ]
+
+
+def extract_json(text: str):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in LLM response")
+    return json.loads(match.group())
+
+@app.post("/predict", response_model=PredictRiskResponse)
+def predict(req: PredictRiskRequest):
+    history = get_user_detection_history(req.user_id)
+
+    if history:
+        input_data = {
+            "user_type": "existing",
+            "detection_history": history,
+            "lifestyle_answers": req.lifestyle_answers
+        }
+    else:
+        input_data = {
+            "user_type": "new",
+            "reported_glucose_history": {
+                "30_days_ago": req.glucose_30_days_ago,
+                "60_days_ago": req.glucose_60_days_ago,
+                "90_days_ago": req.glucose_90_days_ago
+            },
+            "lifestyle_answers": req.lifestyle_answers
+        }
+
+    chain = RISK_PREDICTION_PROMPT | llm
+    response = chain.invoke({"input_data": input_data})
+
+    import json
+    result = extract_json(response.content)  # safe because output is forced JSON
+
+    return PredictRiskResponse(
+        risk_trend=result["risk_trend"],
+        confidence=result["confidence"],
+        reasoning=result["reasoning"],
+        future_outlook=result["future_outlook"],
+        note="This is an AI-assisted risk trend estimation, not a medical diagnosis."
+    )
+
