@@ -33,5 +33,12 @@ class DiabetesRecord(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class RiskTrend(Base):
+    __tablename__ = "risk_trends"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    risk_trend = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

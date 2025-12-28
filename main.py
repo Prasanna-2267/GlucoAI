@@ -8,33 +8,36 @@ from typing import Optional, Dict
 from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import pytesseract
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 from fastapi.middleware.cors import CORSMiddleware
-
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
-
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
-
 from sqlalchemy import create_engine, Column, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
-
-from models import DiabetesRecord
-
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+from models import User, DiabetesRecord, RiskTrend
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 # --------------------------------------------------
 # Load Environment Variables
 # --------------------------------------------------
 load_dotenv()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 60
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
@@ -69,7 +72,150 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
 
-    
+
+# --------------- GOOGLE AUTHENTICATION -------------------
+#------Add security dependency-------
+security = HTTPBearer()
+#------------------------------------
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM],options={"verify_exp": True})
+        user_id = payload.get("user_id")
+
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        db = SessionLocal()
+        user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
+        db.close()
+
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+
+        return user
+
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not GOOGLE_CLIENT_ID:
+    raise RuntimeError("GOOGLE_CLIENT_ID not set")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
+
+
+# --------------------------------------------------
+# DATABASE SETUP
+# --------------------------------------------------
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+
+# --------------------------------------------------
+# AUTO CREATE TABLES
+# --------------------------------------------------
+Base.metadata.create_all(bind=engine)
+
+
+
+# --------------------------------------------------
+# REQUEST / RESPONSE SCHEMAS
+# --------------------------------------------------
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+class GoogleAuthResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: str
+    email: str
+    name: str
+    is_new_user: bool
+
+
+# --------------------------------------------------
+# GOOGLE AUTH ENDPOINT
+# --------------------------------------------------
+@app.post("/auth/google", response_model=GoogleAuthResponse)
+def google_auth(request: GoogleAuthRequest):
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            request.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+
+        email = idinfo.get("email")
+        name = idinfo.get("name")
+
+        if not email or not name:
+            raise HTTPException(status_code=400, detail="Invalid Google token")
+
+        db = SessionLocal()
+        user = db.query(User).filter(User.email == email).first()
+
+        if user:
+            access_token = create_access_token({
+                "user_id": str(user.id),
+                "email": user.email
+            })
+
+            return GoogleAuthResponse(
+                access_token=access_token,
+                token_type="bearer",
+                user_id=str(user.id),
+                email=user.email,
+                name=user.name,
+                is_new_user=False
+            )
+
+        new_user = User(
+            id=uuid.uuid4(),
+            email=email,
+            name=name
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        access_token = create_access_token({
+            "user_id": str(new_user.id),
+            "email": new_user.email
+        })
+
+        return GoogleAuthResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user_id=str(new_user.id),
+            email=new_user.email,
+            name=new_user.name,
+            is_new_user=True
+        )
+
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired Google token")
+
+    finally:
+        db.close()
 
 # --------------------------------------------------
 # Gemini LLM (LangChain 2025)
@@ -131,17 +277,17 @@ async def chat_diabetes(request: ChatRequest):
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
-from xgboost import XGBClassifier
-from sklearn.preprocessing import StandardScaler
-
 # -------------------------------------------------
 # LOAD MODEL
 # -------------------------------------------------
 MODEL_PATH = "models/diabetes_xgboost_model.json"
 SCALER_PATH = "models/scaler.pkl"
 
+import xgboost as xgb
+
 model = XGBClassifier()
 model.load_model(MODEL_PATH)
+
 
 with open(SCALER_PATH, "rb") as f:
     scaler: StandardScaler = pickle.load(f)
@@ -155,10 +301,7 @@ DEFAULT_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{data}")
 ])
 
-# -------------------------------------------------
-# FASTAPI APP
-# -------------------------------------------------
-app = FastAPI(title="Diabetes Detection API")
+
 
 # -------------------------------------------------
 # OCR EXTRACTION (placeholder)
@@ -207,8 +350,6 @@ def run_ocr(file: UploadFile) -> dict:
 
 class DetectRequest(BaseModel):
     age: int
-    user_id: str 
-
     glucose: Optional[float] = None
     blood_pressure: Optional[float] = None
     skin_thickness: Optional[float] = None
@@ -239,62 +380,60 @@ class DetectResponse(BaseModel):
 @app.post("/model-upload", response_model=DetectResponse)
 async def detect_from_report_with_model(
     file: UploadFile = File(...),
-    user_id: str = Form(...), 
-    # User-provided fallback values
+    current_user: User = Depends(get_current_user),
     age: Optional[int] = None,
     blood_pressure: Optional[float] = None,
-
     pregnancies: int = 0,
     diabetes_pedigree: float = 0.5
 ):
     """
-    Upload report -> OCR -> ask user if critical fields missing -> model prediction
+    Upload report → OCR → validate missing critical fields → model prediction
     """
+
     db = SessionLocal()
 
     # 1️⃣ OCR extraction
-    extracted = run_ocr(file)
+    ocr_data = run_ocr(file)
 
-    # 2️⃣ Resolve AGE (OCR doesn't extract age → must come from user)
+    # 2️⃣ Resolve AGE (must come from user)
     final_age = age
 
-    # 3️⃣ Resolve BLOOD PRESSURE (OCR → user)
-    final_bp = (
-        extracted.get("blood_pressure")
-        if extracted.get("blood_pressure") is not None
-        else blood_pressure
-    )
+    # 3️⃣ Resolve BLOOD PRESSURE (OCR has priority)
+    if ocr_data.get("blood_pressure") is not None:
+        final_bp = ocr_data["blood_pressure"]
+    else:
+        final_bp = blood_pressure
 
-    # 4️⃣ ❗ Validate critical fields
-    missing_required = []
+    # 4️⃣ Validate ONLY after resolution
+    missing_fields = []
     if final_age is None:
-        missing_required.append("age")
+        missing_fields.append("age")
     if final_bp is None:
-        missing_required.append("blood_pressure")
+        missing_fields.append("blood_pressure")
 
-    if missing_required:
+    if missing_fields:
         raise HTTPException(
             status_code=400,
             detail={
-                "message": "Please provide the missing required fields to continue prediction.",
-                "missing_fields": missing_required,
-                "ocr_extracted": extracted
+                "message": "Please provide missing required fields to continue prediction.",
+                "missing_fields": missing_fields,
+                "ocr_extracted": ocr_data
             }
         )
 
-    # 5️⃣ Fill remaining values safely
+    # 5️⃣ Merge all features safely
     final_data = {
         "pregnancies": pregnancies,
-        "glucose": extracted.get("glucose") or 120.0,
+        "glucose": ocr_data.get("glucose") if ocr_data.get("glucose") is not None else 120.0,
         "blood_pressure": float(final_bp),
-        "skin_thickness": extracted.get("skin_thickness") or 20.0,
-        "insulin": extracted.get("insulin") or 80.0,
-        "bmi": extracted.get("bmi") or 25.0,
+        "skin_thickness": ocr_data.get("skin_thickness") if ocr_data.get("skin_thickness") is not None else 20.0,
+        "insulin": ocr_data.get("insulin") if ocr_data.get("insulin") is not None else 80.0,
+        "bmi": ocr_data.get("bmi") if ocr_data.get("bmi") is not None else 25.0,
         "diabetes_pedigree": diabetes_pedigree,
         "age": int(final_age)
     }
 
-    # 6️⃣ Model input (exact training order)
+    # 6️⃣ Model input (training order preserved)
     X = np.array([[
         final_data["pregnancies"],
         final_data["glucose"],
@@ -309,55 +448,52 @@ async def detect_from_report_with_model(
     # 7️⃣ Scale + Predict
     X_scaled = scaler.transform(X)
     prob = model.predict_proba(X_scaled)[0][1]
-    prediction = "diabetic" if prob >= 0.5 else "non-diabetic"
+    prediction = "Diabetic" if prob >= 0.5 else "Non-Diabetic"
 
+    # 8️⃣ Store result
     record = DiabetesRecord(
-        user_id=uuid.UUID(user_id),
-            glucose=final_data["glucose"],
-            blood_pressure=final_data["blood_pressure"],
-            skin_thickness=final_data["skin_thickness"],
-            insulin=final_data["insulin"],
-            bmi=final_data["bmi"],
-            age=final_data["age"],
-            prediction=prediction,
-            probability=float(prob)
-        )
+        user_id=current_user.id,
+        glucose=final_data["glucose"],
+        blood_pressure=final_data["blood_pressure"],
+        skin_thickness=final_data["skin_thickness"],
+        insulin=final_data["insulin"],
+        bmi=final_data["bmi"],
+        age=final_data["age"],
+        prediction=prediction.lower(),
+        probability=float(prob)
+    )
+
     db.add(record)
     db.commit()
+    db.close()
 
-    # 8️⃣ Return result
+    # 9️⃣ Return response
     return DetectResponse(
-        prediction="Diabetic" if prob >= 0.5 else "Non-Diabetic",
+        prediction=prediction,
         probability=round(float(prob), 4),
         values_used=final_data
     )
 
-
 # -------------------------------------------------
 # 2️⃣ MANUAL / HYBRID ENDPOINT
 # -------------------------------------------------
-@app.post("/detect/manual", response_model=DetectResponse)
-def detect_manual(req: DetectRequest):
-    db = SessionLocal()
-    data = {
-        "glucose": req.glucose,
-        "blood_pressure": req.blood_pressure,
-        "skin_thickness": req.skin_thickness,
-        "insulin": req.insulin,
-        "bmi": req.bmi
-    }
+@app.post("/detect/manual")
+def detect_manual(
+    req: DetectRequest,
+    current_user: User = Depends(get_current_user)
+):
+    # current_user is already verified via JWT
 
     final_data = {
-        "pregnancies": req.pregnancies if req.pregnancies is not None else 0,
-        "glucose": float(req.glucose),
-        "blood_pressure": float(req.blood_pressure) if req.blood_pressure is not None else 70.0,
-        "skin_thickness": float(req.skin_thickness) if req.skin_thickness is not None else 20.0,
-        "insulin": float(req.insulin) if req.insulin is not None else 80.0,
-        "bmi": float(req.bmi),
-        "diabetes_pedigree": float(req.diabetes_pedigree) if req.diabetes_pedigree is not None else 0.5,
-        "age": int(req.age)
+        "pregnancies": req.pregnancies or 0,
+        "glucose": req.glucose,
+        "blood_pressure": req.blood_pressure or 83.0,
+        "skin_thickness": req.skin_thickness or 20.0,
+        "insulin": req.insulin or 80.0,
+        "bmi": req.bmi or 25.0,
+        "diabetes_pedigree": req.diabetes_pedigree or 0.5,
+        "age": req.age
     }
-
 
     X = np.array([[
         final_data["pregnancies"],
@@ -370,143 +506,40 @@ def detect_manual(req: DetectRequest):
         final_data["age"]
     ]])
 
-
     X_scaled = scaler.transform(X)
     prob = model.predict_proba(X_scaled)[0][1]
-    prediction = "diabetic" if prob >= 0.5 else "non-diabetic"
 
+    prediction = "Diabetic" if prob >= 0.5 else "Non-Diabetic"
+
+    # STORE USING JWT USER
     record = DiabetesRecord(
-        user_id=uuid.UUID(req.user_id),
-            glucose=final_data["glucose"],
-            blood_pressure=final_data["blood_pressure"],
-            skin_thickness=final_data["skin_thickness"],
-            insulin=final_data["insulin"],
-            bmi=final_data["bmi"],
-            age=final_data["age"],
-            prediction=prediction,
-            probability=float(prob)
-        )
-    db.add(record)
-    db.commit()
-
-    return DetectResponse(
-        prediction="Diabetic" if prob >= 0.5 else "Non-Diabetic",
-        probability=round(float(prob), 4),
-        values_used=final_data
+        user_id=current_user.id,
+        glucose=final_data["glucose"],
+        blood_pressure=final_data["blood_pressure"],
+        skin_thickness=final_data["skin_thickness"],
+        insulin=final_data["insulin"],
+        bmi=final_data["bmi"],
+        age=final_data["age"],
+        prediction=prediction,
+        probability=float(prob)
     )
 
-# --------------- GOOGLE AUTHENTICATION -------------------
+    db = SessionLocal()
+    db.add(record)
+    db.commit()
+    db.close()
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-DATABASE_URL = os.getenv("DATABASE_URL")
+    return {
+        "prediction": prediction,
+        "probability": round(float(prob), 4),
+        "values_used": final_data
+    }
 
-if not GOOGLE_CLIENT_ID:
-    raise RuntimeError("GOOGLE_CLIENT_ID not set")
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
-
-# --------------------------------------------------
-# DATABASE SETUP
-# --------------------------------------------------
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
-
-# --------------------------------------------------
-# USER MODEL
-# --------------------------------------------------
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email = Column(String, unique=True, nullable=False)
-    name = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-# --------------------------------------------------
-# AUTO CREATE TABLES
-# --------------------------------------------------
-Base.metadata.create_all(bind=engine)
-
-
-
-# --------------------------------------------------
-# REQUEST / RESPONSE SCHEMAS
-# --------------------------------------------------
-class GoogleAuthRequest(BaseModel):
-    id_token: str
-
-class GoogleAuthResponse(BaseModel):
-    user_id: str
-    email: str
-    name: str
-    is_new_user: bool
-
-# --------------------------------------------------
-# GOOGLE AUTH ENDPOINT
-# --------------------------------------------------
-@app.post("/auth/google", response_model=GoogleAuthResponse)
-def google_auth(request: GoogleAuthRequest):
-    try:
-        # 1️⃣ Verify Google ID Token
-        idinfo = id_token.verify_oauth2_token(
-            request.id_token,
-            google_requests.Request(),
-            GOOGLE_CLIENT_ID
-        )
-
-        email = idinfo.get("email")
-        name = idinfo.get("name")
-
-        if not email or not name:
-            raise HTTPException(status_code=400, detail="Invalid Google token")
-
-        db = SessionLocal()
-
-        # 2️⃣ Check if user exists
-        user = db.query(User).filter(User.email == email).first()
-
-        if user:
-            return GoogleAuthResponse(
-                user_id=str(user.id),
-                email=user.email,
-                name=user.name,
-                is_new_user=False
-            )
-
-        # 3️⃣ Create new user
-        new_user = User(
-            id=uuid.uuid4(),
-            email=email,
-            name=name
-        )
-
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-
-        return GoogleAuthResponse(
-            user_id=str(new_user.id),
-            email=new_user.email,
-            name=new_user.name,
-            is_new_user=True
-        )
-
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid or expired Google token")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
 
 # --------------------------------------------------
 # PREDICT ENDPOINT
 # --------------------------------------------------
-
 class PredictRiskRequest(BaseModel):
-    user_id: str
-
     # Only required if NO history exists
     glucose_30_days_ago: Optional[float] = None
     glucose_60_days_ago: Optional[float] = None
@@ -594,11 +627,17 @@ def extract_json(text: str):
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in LLM response")
-    return json.loads(match.group())
+    return json.loads(match.group()) 
 
 @app.post("/predict", response_model=PredictRiskResponse)
-def predict(req: PredictRiskRequest):
-    history = get_user_detection_history(req.user_id)
+def predict(
+    req: PredictRiskRequest,
+    current_user: User = Depends(get_current_user)
+):
+    # 🔐 user identity comes from JWT, NOT request body
+    user_id = str(current_user.id)
+
+    history = get_user_detection_history(user_id)
 
     if history:
         input_data = {
@@ -620,14 +659,141 @@ def predict(req: PredictRiskRequest):
     chain = RISK_PREDICTION_PROMPT | llm
     response = chain.invoke({"input_data": input_data})
 
-    import json
-    result = extract_json(response.content)  # safe because output is forced JSON
+    try:
+        result = extract_json(response.content)
+    except ValueError:
+        raise HTTPException(500, "LLM output invalid")
+    
+    risk_trend_value = result["risk_trend"]
+
+    db = SessionLocal()
+    record = RiskTrend(
+        user_id=current_user.id,
+        risk_trend=risk_trend_value
+    )
+    db.add(record)
+    db.commit()
+    db.close()
+
 
     return PredictRiskResponse(
         risk_trend=result["risk_trend"],
         confidence=result["confidence"],
         reasoning=result["reasoning"],
-        future_outlook=result["future_outlook"],
+        future_outlook=result.get("future_outlook", []),
         note="This is an AI-assisted risk trend estimation, not a medical diagnosis."
     )
 
+#--------------------------------------------------
+# DIETARY RECOMMENDATIONS ENDPOINT
+#--------------------------------------------------
+class DietRecommendRequest(BaseModel):
+    diet_preference: str          # vegetarian / non-vegetarian / eggetarian
+    meals_per_day: int            # 2 / 3 / 4
+    eats_outside: str             # rarely / weekly / frequently
+    cultural_preference: str      # indian / mixed / no preference
+    allergies: Optional[str] = None
+    
+
+class DietRecommendResponse(BaseModel):
+    diet_type: str
+    foods_to_prefer: list[str]
+    foods_to_limit: list[str]
+    tips: list[str]
+    note: str
+
+def get_latest_risk_trend(user_id: uuid.UUID):
+    db = SessionLocal()
+    record = (
+        db.query(RiskTrend)
+        .filter(RiskTrend.user_id == user_id)
+        .order_by(RiskTrend.created_at.desc())
+        .first()
+    )
+    db.close()
+    return record.risk_trend if record else None
+
+DIET_RECOMMEND_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+You are an AI assistant providing qualitative DIET RECOMMENDATIONS.
+
+STRICT RULES:
+- This is NOT medical advice.
+- Do NOT suggest medications or supplements.
+- Do NOT give numeric calorie values.
+- Keep recommendations general and lifestyle-based.
+
+You must provide:
+- diet_type: short label (e.g., Vegetarian, Balanced, Low Sugar)
+- foods_to_prefer: EXACTLY 5 items
+- foods_to_limit: EXACTLY 5 items
+- tips: EXACTLY 3 general lifestyle tips
+
+Return ONLY valid JSON in this exact format:
+{{
+  "diet_type": "",
+  "foods_to_prefer": [],
+  "foods_to_limit": [],
+  "tips": []
+}}
+
+Do NOT include explanations, markdown, or text outside JSON.
+        """
+    ),
+    ("human", "{input_data}")
+])
+
+
+
+@app.post("/diet-recommend", response_model=DietRecommendResponse)
+def diet_recommend(
+    req: DietRecommendRequest,
+    current_user: User = Depends(get_current_user)
+):
+    # 🔐 user identity from JWT
+    user_id = current_user.id
+
+    # 1️⃣ Fetch latest risk trend
+    risk_trend = get_latest_risk_trend(user_id)
+
+    if not risk_trend:
+        raise HTTPException(
+            status_code=400,
+            detail="Risk trend not available. Please run prediction first."
+        )
+
+    # 2️⃣ Prepare input for Gemini
+    input_data = {
+        "risk_trend": risk_trend,
+        "diet_preference": req.diet_preference,
+        "meals_per_day": req.meals_per_day,
+        "eats_outside": req.eats_outside,
+        "cultural_preference": req.cultural_preference,
+        "allergies": req.allergies
+    }
+
+    # 3️⃣ Invoke Gemini
+    chain = DIET_RECOMMEND_PROMPT | llm
+    response = chain.invoke({"input_data": input_data})
+
+    result = extract_json(response.content)
+    diet_type = result.get("diet_type", "General diabetic-friendly diet")
+    foods_to_prefer = result.get("foods_to_prefer", [])
+    foods_to_limit = result.get("foods_to_limit", [])
+    tips = result.get("tips", [])
+
+    # Enforce exact counts (as per prompt contract)
+    foods_to_prefer = foods_to_prefer[:5]
+    foods_to_limit = foods_to_limit[:5]
+    tips = tips[:3]
+
+
+    return DietRecommendResponse(
+    diet_type=diet_type,
+    foods_to_prefer=foods_to_prefer,
+    foods_to_limit=foods_to_limit,
+    tips=tips,
+    note="This is an AI-assisted dietary suggestion, not medical advice."
+)
