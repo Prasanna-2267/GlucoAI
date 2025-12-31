@@ -29,6 +29,17 @@ from datetime import datetime, timedelta
 from models import User, DiabetesRecord, RiskTrend
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from typing import Callable
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 # --------------------------------------------------
 # Load Environment Variables
 # --------------------------------------------------
@@ -72,6 +83,11 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
 
+class ChatbotRequest(BaseModel):
+    question: str
+
+class ChatbotResponse(BaseModel):
+    answer: str
 
 # --------------- GOOGLE AUTHENTICATION -------------------
 #------Add security dependency-------
@@ -245,7 +261,7 @@ STRICT RULES:
 
 IMPORTANT:
 - Educational purpose only
-- Do NOT provide medical diagnosis
+- Do provide medical diagnosis also mention consulting a healthcare professional
 - Use simple, clear language
 
 If unrelated, reply exactly:
@@ -265,16 +281,120 @@ def health():
 # --------------------------------------------------
 # Chat Endpoint
 # --------------------------------------------------
-@app.post("/chat", response_model=ChatResponse)
-async def chat_diabetes(request: ChatRequest):
-    try:
-        chain = DIABETES_PROMPT | llm
-        response = chain.invoke({"question": request.question})
 
-        return ChatResponse(answer=response.content)
+def rag_pipeline(
+    pdf_path: str,
+    query: str,
+    progress_callback=print
+):
+    load_dotenv()
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+    if not GOOGLE_API_KEY:
+        raise ValueError("GOOGLE_API_KEY not found")
+
+    try:
+        # ✅ ONLY progress message
+        progress_callback("📄 Loading PDF...")
+
+        # 1️⃣ Load PDF
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        # 2️⃣ Split text
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        docs = splitter.split_documents(documents)
+
+        # 3️⃣ Embeddings
+        embedding_model = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+        # 4️⃣ FAISS index
+        vector_store = FAISS.from_documents(docs, embedding_model)
+
+        # 5️⃣ Retrieve context
+        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        context_docs = retriever.invoke(query)
+        context_text = "\n\n".join(doc.page_content for doc in context_docs)
+
+        # 6️⃣ Gemini
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.3
+        )
+
+        prompt = DIABETES_PROMPT
+
+        response = llm.invoke(
+            prompt.format(context=context_text, question=query)
+        )
+
+        return response.content
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        progress_callback(f"❌ Error: {str(e)}")
+        return None
+    
+def llm_only_answer(query: str) -> str:
+    load_dotenv()
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.3
+    )
+
+    prompt = DIABETES_PROMPT
+    response = llm.invoke(prompt.format(question=query))
+    return response.content
+
+
+
+from fastapi import UploadFile, File, Form, HTTPException
+
+@app.post("/chatbot", response_model=ChatbotResponse)
+async def chatbot(
+    question: str = Form(...),
+    pdf: Optional[UploadFile] = File(None)
+):
+    """
+    Chatbot with optional RAG support.
+    """
+
+    # CASE 1️⃣: PDF provided → RAG
+    if pdf:
+        pdf_path = f"temp_{pdf.filename}"
+
+        with open(pdf_path, "wb") as f:
+            f.write(await pdf.read())
+
+        answer = rag_pipeline(
+            pdf_path=pdf_path,
+            query=question
+        )
+
+        os.remove(pdf_path)
+
+        if answer:
+            return ChatbotResponse(
+                answer=answer,
+                source="rag"
+            )
+
+    # CASE 2️⃣: No PDF or RAG failed → LLM only
+    answer = llm_only_answer(question)
+
+    return ChatbotResponse(
+        answer=answer,
+        source="llm"
+    )
+
 
 
 # -------------------------------------------------
@@ -691,13 +811,18 @@ class DietRecommendRequest(BaseModel):
     diet_preference: str          # vegetarian / non-vegetarian / eggetarian
     meals_per_day: int            # 2 / 3 / 4
     eats_outside: str             # rarely / weekly / frequently
-    cultural_preference: str      # indian / mixed / no preference
+    cultural_preference: str 
+    preferred_food_breakfast: str 
+    preferred_food_lunch: str 
+    preferred_food_dinner: str
     allergies: Optional[str] = None
     
 
 class DietRecommendResponse(BaseModel):
     diet_type: str
-    foods_to_prefer: list[str]
+    foods_to_prefer_breakfast: list[str]
+    foods_to_prefer_lunch: list[str]
+    foods_to_prefer_dinner: list[str]
     foods_to_limit: list[str]
     tips: list[str]
     note: str
@@ -727,16 +852,21 @@ STRICT RULES:
 
 You must provide:
 - diet_type: short label (e.g., Vegetarian, Balanced, Low Sugar)
-- foods_to_prefer: EXACTLY 5 items
-- foods_to_limit: EXACTLY 5 items
-- tips: EXACTLY 3 general lifestyle tips
+- foods_to_prefer_breakfast:  3-5 items for breakfast
+- foods_to_prefer_lunch:  3-5 items for lunch
+- foods_to_prefer_dinner:  3 items for dinner
+- foods_to_limit:  3-5 items
+- tips: 3-5 general lifestyle tips
 
 Return ONLY valid JSON in this exact format:
 {{
   "diet_type": "",
-  "foods_to_prefer": [],
+  "foods_to_prefer_breakfast": [],
+  "foods_to_prefer_lunch": [],
+  "foods_to_prefer_dinner": [],
   "foods_to_limit": [],
-  "tips": []
+  "tips": [],
+  "note": ""
 }}
 
 Do NOT include explanations, markdown, or text outside JSON.
@@ -752,12 +882,10 @@ def diet_recommend(
     req: DietRecommendRequest,
     current_user: User = Depends(get_current_user)
 ):
-    # 🔐 user identity from JWT
     user_id = current_user.id
 
     # 1️⃣ Fetch latest risk trend
     risk_trend = get_latest_risk_trend(user_id)
-
     if not risk_trend:
         raise HTTPException(
             status_code=400,
@@ -771,6 +899,9 @@ def diet_recommend(
         "meals_per_day": req.meals_per_day,
         "eats_outside": req.eats_outside,
         "cultural_preference": req.cultural_preference,
+        "preferred_food_breakfast": req.preferred_food_breakfast,
+        "preferred_food_lunch": req.preferred_food_lunch,
+        "preferred_food_dinner": req.preferred_food_dinner,
         "allergies": req.allergies
     }
 
@@ -779,21 +910,101 @@ def diet_recommend(
     response = chain.invoke({"input_data": input_data})
 
     result = extract_json(response.content)
-    diet_type = result.get("diet_type", "General diabetic-friendly diet")
-    foods_to_prefer = result.get("foods_to_prefer", [])
-    foods_to_limit = result.get("foods_to_limit", [])
-    tips = result.get("tips", [])
 
-    # Enforce exact counts (as per prompt contract)
-    foods_to_prefer = foods_to_prefer[:5]
-    foods_to_limit = foods_to_limit[:5]
-    tips = tips[:3]
-
-
+    # 4️⃣ Extract fields EXACTLY as schema expects
     return DietRecommendResponse(
-    diet_type=diet_type,
-    foods_to_prefer=foods_to_prefer,
-    foods_to_limit=foods_to_limit,
-    tips=tips,
-    note="This is an AI-assisted dietary suggestion, not medical advice."
-)
+        diet_type=result.get("diet_type", "Balanced diabetic-friendly diet"),
+        foods_to_prefer_breakfast=result.get("foods_to_prefer_breakfast", [])[:5],
+        foods_to_prefer_lunch=result.get("foods_to_prefer_lunch", [])[:5],
+        foods_to_prefer_dinner=result.get("foods_to_prefer_dinner", [])[:3],
+        foods_to_limit=result.get("foods_to_limit", [])[:5],
+        tips=result.get("tips", [])[:5],
+        note=result.get(
+            "note",
+            "This is an AI-assisted dietary suggestion, not medical advice."
+        )
+    )
+
+
+# --------------------------------------------------
+# User history endpoint
+# --------------------------------------------------
+class DetectionHistoryItem(BaseModel):
+    glucose: float
+    blood_pressure: float
+    bmi: float
+    age: int
+    prediction: str
+    probability: float
+    created_at: datetime
+
+
+class RiskHistoryItem(BaseModel):
+    risk_trend: str
+    created_at: datetime
+
+
+class UserHistoryResponse(BaseModel):
+    detections: list[DetectionHistoryItem]
+    risk_predictions: list[RiskHistoryItem]
+
+@app.get("/history", response_model=UserHistoryResponse)
+def get_user_history(
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    # 1️⃣ Fetch detection history
+    detection_records = (
+        db.query(DiabetesRecord)
+        .filter(DiabetesRecord.user_id == current_user.id)
+        .order_by(DiabetesRecord.created_at.desc())
+        .all()
+    )
+
+    detections = [
+        DetectionHistoryItem(
+            glucose=r.glucose,
+            blood_pressure=r.blood_pressure,
+            bmi=r.bmi,
+            age=r.age,
+            prediction=r.prediction,
+            probability=r.probability,
+            created_at=r.created_at
+        )
+        for r in detection_records
+    ]
+
+    # 2️⃣ Fetch risk prediction history
+    risk_records = (
+        db.query(RiskTrend)
+        .filter(RiskTrend.user_id == current_user.id)
+        .order_by(RiskTrend.created_at.desc())
+        .all()
+    )
+
+    risk_predictions = [
+        RiskHistoryItem(
+            risk_trend=r.risk_trend,
+            created_at=r.created_at
+        )
+        for r in risk_records
+    ]
+
+    db.close()
+
+    # 3️⃣ Return combined history
+    return UserHistoryResponse(
+        detections=detections,
+        risk_predictions=risk_predictions
+    )
+
+# --------------------------------------------------
+# Logout Endpoint (Client-side token discard)
+@app.post("/auth/logout")
+def logout():
+    return {"message": "Logged out successfully"}
+# --------------------------------------------------
+
+
+
