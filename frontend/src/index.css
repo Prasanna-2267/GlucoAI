@@ -1,0 +1,170 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+@layer base {
+  :root {
+    --background: 220 25% 6%;
+    --foreground: 218 11% 91%;
+
+    --card: 217 30% 12%;
+    --card-foreground: 218 11% 91%;
+
+    --popover: 217 30% 10%;
+    --popover-foreground: 218 11% 91%;
+
+    --primary: 185 85% 45%;
+    --primary-foreground: 220 25% 6%;
+
+    --secondary: 217 25% 18%;
+    --secondary-foreground: 218 11% 91%;
+
+    --muted: 217 25% 16%;
+    --muted-foreground: 218 11% 55%;
+
+    --accent: 185 70% 35%;
+    --accent-foreground: 218 11% 91%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 218 11% 91%;
+
+    --border: 217 25% 20%;
+    --input: 217 25% 18%;
+    --ring: 185 85% 45%;
+
+    --radius: 0.75rem;
+
+    /* Custom GlucoAI tokens */
+    --glow-primary: 185 85% 45%;
+    --glow-secondary: 200 80% 50%;
+    --surface-elevated: 217 28% 14%;
+    --surface-glass: 217 30% 12%;
+    --gradient-start: 185 85% 45%;
+    --gradient-end: 200 80% 50%;
+    --success: 142 76% 45%;
+    --warning: 38 92% 50%;
+    --info: 200 85% 50%;
+
+    --sidebar-background: 220 25% 8%;
+    --sidebar-foreground: 218 11% 91%;
+    --sidebar-primary: 185 85% 45%;
+    --sidebar-primary-foreground: 220 25% 6%;
+    --sidebar-accent: 217 25% 18%;
+    --sidebar-accent-foreground: 218 11% 91%;
+    --sidebar-border: 217 25% 20%;
+    --sidebar-ring: 185 85% 45%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    @apply bg-card/80 backdrop-blur-xl border border-border/50 rounded-xl;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-all duration-300 hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5;
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary to-info bg-clip-text text-transparent;
+  }
+
+  .glow-primary {
+    box-shadow: 0 0 40px -10px hsl(var(--primary) / 0.4);
+  }
+
+  .glow-button {
+    @apply relative overflow-hidden;
+  }
+
+  .glow-button::before {
+    content: '';
+    @apply absolute inset-0 bg-gradient-to-r from-primary to-info opacity-0 transition-opacity duration-300;
+  }
+
+  .glow-button:hover::before {
+    @apply opacity-20;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  .animate-pulse-slow {
+    animation: pulse-slow 4s ease-in-out infinite;
+  }
+
+  .animate-gradient {
+    animation: gradient 8s ease infinite;
+    background-size: 200% 200%;
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes pulse-slow {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes gradient {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-background;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-muted rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-muted-foreground/50;
+}
