@@ -1,4 +1,5 @@
 import os
+import io
 import pickle
 import numpy as np
 import json
@@ -39,6 +40,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
+from db import Base, SessionLocal
 
 # --------------------------------------------------
 # Load Environment Variables
@@ -66,13 +68,18 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5500",
-        "http://127.0.0.1:5500"
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --------------------------------------------------
 # Request / Response Schemas
@@ -88,6 +95,7 @@ class ChatbotRequest(BaseModel):
 
 class ChatbotResponse(BaseModel):
     answer: str
+    source: str
 
 # --------------- GOOGLE AUTHENTICATION -------------------
 #------Add security dependency-------
@@ -142,8 +150,6 @@ if not DATABASE_URL:
 # --------------------------------------------------
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
-
 
 
 # --------------------------------------------------
@@ -173,6 +179,7 @@ class GoogleAuthResponse(BaseModel):
 # --------------------------------------------------
 @app.post("/auth/google", response_model=GoogleAuthResponse)
 def google_auth(request: GoogleAuthRequest):
+    db = None
     try:
         idinfo = id_token.verify_oauth2_token(
             request.id_token,
@@ -182,6 +189,8 @@ def google_auth(request: GoogleAuthRequest):
 
         email = idinfo.get("email")
         name = idinfo.get("name")
+        picture = idinfo.get("picture")  # ✅ google profile photo url
+        provider = "google"
 
         if not email or not name:
             raise HTTPException(status_code=400, detail="Invalid Google token")
@@ -189,7 +198,14 @@ def google_auth(request: GoogleAuthRequest):
         db = SessionLocal()
         user = db.query(User).filter(User.email == email).first()
 
+        # ✅ If user exists → update profile fields
         if user:
+            user.name = name
+            user.avatar_url = picture
+            user.provider = provider
+            db.commit()
+            db.refresh(user)
+
             access_token = create_access_token({
                 "user_id": str(user.id),
                 "email": user.email
@@ -204,11 +220,15 @@ def google_auth(request: GoogleAuthRequest):
                 is_new_user=False
             )
 
+        # ✅ New user creation
         new_user = User(
             id=uuid.uuid4(),
             email=email,
-            name=name
+            name=name,
+            avatar_url=picture,
+            provider=provider
         )
+
         db.add(new_user)
         db.commit()
         db.refresh(new_user)
@@ -231,7 +251,8 @@ def google_auth(request: GoogleAuthRequest):
         raise HTTPException(status_code=401, detail="Invalid or expired Google token")
 
     finally:
-        db.close()
+        if db:
+            db.close()
 
 # --------------------------------------------------
 # Gemini LLM (LangChain 2025)
@@ -429,26 +450,29 @@ DEFAULT_PROMPT = ChatPromptTemplate.from_messages([
 def run_ocr(file: UploadFile) -> dict:
     """
     Extracts diabetes-related values from a medical report image or PDF.
-    This is a demo OCR implementation for resume projects.
+    Supports PDF / JPG / PNG.
     """
 
-    # -------- Step 1: Read file --------
+    # ✅ Read file ONLY ONCE
     content = file.file.read()
 
     text = ""
 
-    # -------- Step 2: Handle PDF or Image --------
-    if file.filename.lower().endswith(".pdf"):
+    filename = (file.filename or "").lower()
+
+    # ✅ PDF handling
+    if filename.endswith(".pdf"):
         images = convert_from_bytes(content)
         for img in images:
             text += pytesseract.image_to_string(img)
+
+    # ✅ Image handling
     else:
-        image = Image.open(file.file)
-        text = pytesseract.image_to_string(image)
+        img = Image.open(io.BytesIO(content))
+        text = pytesseract.image_to_string(img)
 
     text = text.lower()
 
-    # -------- Step 3: Regex-based extraction --------
     def extract(pattern):
         match = re.search(pattern, text)
         return float(match.group(1)) if match else None
@@ -458,7 +482,7 @@ def run_ocr(file: UploadFile) -> dict:
         "blood_pressure": extract(r"blood pressure[:\s]*([0-9]+\.?[0-9]*)"),
         "skin_thickness": extract(r"skin thickness[:\s]*([0-9]+\.?[0-9]*)"),
         "insulin": extract(r"insulin[:\s]*([0-9]+\.?[0-9]*)"),
-        "bmi": extract(r"bmi[:\s]*([0-9]+\.?[0-9]*)")
+        "bmi": extract(r"bmi[:\s]*([0-9]+\.?[0-9]*)"),
     }
 
     return extracted_data
@@ -497,14 +521,15 @@ class DetectResponse(BaseModel):
 # -------------------------------------------------
 
 
+
 @app.post("/model-upload", response_model=DetectResponse)
 async def detect_from_report_with_model(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    age: Optional[int] = None,
-    blood_pressure: Optional[float] = None,
-    pregnancies: int = 0,
-    diabetes_pedigree: float = 0.5
+    age: Optional[int] = Form(None),
+    blood_pressure: Optional[float] = Form(None),
+    pregnancies: int = Form(0),
+    diabetes_pedigree: float = Form(0.5),
 ):
     """
     Upload report → OCR → validate missing critical fields → model prediction
@@ -528,8 +553,6 @@ async def detect_from_report_with_model(
     missing_fields = []
     if final_age is None:
         missing_fields.append("age")
-    if final_bp is None:
-        missing_fields.append("blood_pressure")
 
     if missing_fields:
         raise HTTPException(
@@ -545,7 +568,7 @@ async def detect_from_report_with_model(
     final_data = {
         "pregnancies": pregnancies,
         "glucose": ocr_data.get("glucose") if ocr_data.get("glucose") is not None else 120.0,
-        "blood_pressure": float(final_bp),
+        "blood_pressure": float(final_bp) if final_bp is not None else 83.0,
         "skin_thickness": ocr_data.get("skin_thickness") if ocr_data.get("skin_thickness") is not None else 20.0,
         "insulin": ocr_data.get("insulin") if ocr_data.get("insulin") is not None else 80.0,
         "bmi": ocr_data.get("bmi") if ocr_data.get("bmi") is not None else 25.0,
@@ -998,6 +1021,12 @@ def get_user_history(
         detections=detections,
         risk_predictions=risk_predictions
     )
+@app.get("/me/history-status")
+def history_status(current_user: User = Depends(get_current_user)):
+    user_id = str(current_user.id)
+    history = get_user_detection_history(user_id)
+    return {"has_history": bool(history)}
+
 
 # --------------------------------------------------
 # Logout Endpoint (Client-side token discard)
@@ -1006,5 +1035,109 @@ def logout():
     return {"message": "Logged out successfully"}
 # --------------------------------------------------
 
+# --------------------------------------------------
+# Dashboard Metrics Endpoint
+# --------------------------------------------------
+from datetime import datetime, timedelta
+from sqlalchemy import desc
+from fastapi import Depends
+
+@app.get("/dashboard/summary")
+def dashboard_summary(current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+
+    # latest record
+    latest = (
+        db.query(DiabetesRecord)
+        .filter(DiabetesRecord.user_id == current_user.id)
+        .order_by(desc(DiabetesRecord.created_at))
+        .first()
+    )
+
+    # checks this month
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+
+    checks_this_month = (
+        db.query(DiabetesRecord)
+        .filter(DiabetesRecord.user_id == current_user.id)
+        .filter(DiabetesRecord.created_at >= month_start)
+        .count()
+    )
+
+    # latest risk trend
+    latest_risk = (
+        db.query(RiskTrend)
+        .filter(RiskTrend.user_id == current_user.id)
+        .order_by(desc(RiskTrend.created_at))
+        .first()
+    )
+
+    db.close()
+
+    blood_sugar_status = latest.prediction if latest else "No Data"
+    risk_trend = latest_risk.risk_trend if latest_risk else "No Data"
+
+    # ✅ new user handling
+    if not latest and not latest_risk and checks_this_month == 0:
+        return {
+            "blood_sugar_status": "No Data",
+            "risk_trend": "No Data",
+            "diet_status": "No Data",
+            "health_score": None,
+            "checks_this_month": 0,
+            "streak_days": 0,
+            "diet_adherence_percent": None,
+            "recent_activity": []
+        }
+
+    # ✅ diet status logic
+    diet_status = "Active" if checks_this_month > 0 else "Inactive"
+
+    # ✅ health score (only if blood sugar prediction exists)
+    health_score = None
+    if latest:
+        health_score = 85 if latest.prediction == "Non-Diabetic" else 60
+
+    # ✅ diet adherence only if data exists
+    diet_adherence_percent = None
+    if checks_this_month > 0:
+        diet_adherence_percent = 78  # later compute real
+
+    # ✅ recent activity only if user has activity
+    recent_activity = []
+    if latest:
+        recent_activity.append({"title": "Blood sugar check completed", "time": "Recently"})
+    if latest_risk:
+        recent_activity.append({"title": "Risk forecast updated", "time": "Recently"})
+
+    return {
+        "blood_sugar_status": blood_sugar_status,
+        "risk_trend": risk_trend,
+        "diet_status": diet_status,
+        "health_score": health_score,
+        "checks_this_month": checks_this_month,
+        "streak_days": 0,
+        "diet_adherence_percent": diet_adherence_percent,
+        "recent_activity": recent_activity
+    }
+
+class UserMeResponse(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    avatar_url: Optional[str] = None
+    provider: Optional[str] = "google"
+    created_at: datetime
 
 
+@app.get("/me", response_model=UserMeResponse)
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "user_id": str(current_user.id),
+        "email": current_user.email,
+        "name": current_user.name,
+        "avatar_url": getattr(current_user, "avatar_url", None),
+        "provider": getattr(current_user, "provider", "google"),
+        "created_at": current_user.created_at
+        }

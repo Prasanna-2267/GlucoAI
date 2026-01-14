@@ -1,3 +1,88 @@
+# =========================
+# GENERAL
+# =========================
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# =========================
+# ENV FILES / SECRETS
+# =========================
 .env
-.venv
+.env.*
+!.env.example
+
+# =========================
+# PYTHON (FastAPI Backend)
+# =========================
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# FASTAPI / TEMP FILES
+# =========================
+temp_*.pdf
+temp_*.png
+temp_*.jpg
+temp_*.jpeg
+*.sqlite3
+*.db
+
+# =========================
+# NODE / FRONTEND (Vite React)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Vite build output
+dist/
+build/
+
+# Vite cache
+.vite/
+
+# =========================
+# EDITORS / IDE
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# OS / SYSTEM
+# =========================
+Desktop.ini
+
+# =========================
+# DATA / ML MODELS (optional ignore)
+# =========================
+# If you don't want to push large ML models:
+# models/*.pkl
+# models/*.json
+# *.joblib
