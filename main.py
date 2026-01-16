@@ -12,7 +12,12 @@ from pdf2image import convert_from_bytes
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+import os
+import pytesseract
+
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
