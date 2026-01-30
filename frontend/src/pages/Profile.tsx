@@ -17,13 +17,27 @@ import { cn } from "@/lib/utils";
 import { getMyProfile } from "@/services/profile";
 import { logoutUser } from "@/services/session";
 
+
+
+type DietPlan = {
+  diet_type: string;
+  foods_to_prefer_breakfast: string[];
+  foods_to_prefer_lunch: string[];
+  foods_to_prefer_dinner: string[];
+  foods_to_limit: string[];
+  tips: string[];
+  note: string;
+  created_at: string;
+};
+
 type ProfileResponse = {
   user_id: string;
   email: string;
   name: string;
   avatar_url?: string | null;
   provider?: string | null;
-  created_at?: string; // ISO timestamp
+  created_at?: string;
+  latest_diet_plan?: DietPlan | null; // 🔥 NEW
 };
 
 export default function Profile() {
@@ -217,6 +231,75 @@ export default function Profile() {
                   </Link>
                 </div>
               </div>
+
+
+            {/* Latest Diet Plan */}
+{profile.latest_diet_plan && (
+  <div
+    className="glass-card p-6 mb-6 animate-fade-in"
+    style={{ animationDelay: "0.25s" }}
+  >
+    <h2 className="font-semibold mb-4 flex items-center gap-2">
+      🥗 Latest Diet Recommendation
+    </h2>
+
+    <div className="text-sm space-y-3">
+      <p>
+        <span className="font-medium">Diet Type:</span>{" "}
+        {profile.latest_diet_plan.diet_type}
+      </p>
+
+      <div>
+        <p className="font-medium">Breakfast:</p>
+        <ul className="list-disc ml-5 text-muted-foreground">
+          {profile.latest_diet_plan.foods_to_prefer_breakfast.map((f, i) => (
+            <li key={i}>{f}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <p className="font-medium">Lunch:</p>
+        <ul className="list-disc ml-5 text-muted-foreground">
+          {profile.latest_diet_plan.foods_to_prefer_lunch.map((f, i) => (
+            <li key={i}>{f}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <p className="font-medium">Dinner:</p>
+        <ul className="list-disc ml-5 text-muted-foreground">
+          {profile.latest_diet_plan.foods_to_prefer_dinner.map((f, i) => (
+            <li key={i}>{f}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <p className="font-medium">Foods to Limit:</p>
+        <ul className="list-disc ml-5 text-muted-foreground">
+          {profile.latest_diet_plan.foods_to_limit.map((f, i) => (
+            <li key={i}>{f}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <p className="font-medium">Tips:</p>
+        <ul className="list-disc ml-5 text-muted-foreground">
+          {profile.latest_diet_plan.tips.map((t, i) => (
+            <li key={i}>{t}</li>
+          ))}
+        </ul>
+      </div>
+
+      <p className="text-xs text-muted-foreground">
+        {profile.latest_diet_plan.note}
+      </p>
+    </div>
+  </div>
+)}
 
               {/* Logout */}
               <Button

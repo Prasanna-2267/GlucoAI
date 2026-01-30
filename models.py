@@ -1,7 +1,7 @@
 import datetime
 import uuid
-from sqlalchemy import Column, String, DateTime
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Column, String, DateTime, Text
+from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.sql import func
 from sqlalchemy import Integer, Float, ForeignKey
 
@@ -48,3 +48,20 @@ class RiskTrend(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class DietRecommendation(Base):
+    __tablename__ = "diet_recommendations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+
+    diet_type = Column(String)
+
+    foods_to_prefer_breakfast = Column(ARRAY(String))
+    foods_to_prefer_lunch = Column(ARRAY(String))
+    foods_to_prefer_dinner = Column(ARRAY(String))
+    foods_to_limit = Column(ARRAY(String))
+    tips = Column(ARRAY(String))
+
+    note = Column(Text)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

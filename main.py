@@ -32,7 +32,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Depends
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
-from models import User, DiabetesRecord, RiskTrend
+from models import DietRecommendation, User, DiabetesRecord, RiskTrend
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from typing import Callable
@@ -940,6 +940,28 @@ def diet_recommend(
 
     result = extract_json(response.content)
 
+        # 4️⃣ SAVE DIET RECOMMENDATION TO DB (NEW CODE)
+    db = SessionLocal()
+
+    diet_entry = DietRecommendation(
+        user_id=user_id,
+        diet_type=result.get("diet_type", "Balanced diabetic-friendly diet"),
+        foods_to_prefer_breakfast=result.get("foods_to_prefer_breakfast", [])[:5],
+        foods_to_prefer_lunch=result.get("foods_to_prefer_lunch", [])[:5],
+        foods_to_prefer_dinner=result.get("foods_to_prefer_dinner", [])[:3],
+        foods_to_limit=result.get("foods_to_limit", [])[:5],
+        tips=result.get("tips", [])[:5],
+        note=result.get(
+            "note",
+            "This is an AI-assisted dietary suggestion, not medical advice."
+        )
+    )
+
+    db.add(diet_entry)
+    db.commit()
+    db.close()
+
+
     # 4️⃣ Extract fields EXACTLY as schema expects
     return DietRecommendResponse(
         diet_type=result.get("diet_type", "Balanced diabetic-friendly diet"),
@@ -1137,13 +1159,36 @@ class UserMeResponse(BaseModel):
     created_at: datetime
 
 
-@app.get("/me", response_model=UserMeResponse)
+@app.get("/me")
 def get_me(current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+
+    latest_diet = (
+        db.query(DietRecommendation)
+        .filter(DietRecommendation.user_id == current_user.id)
+        .order_by(DietRecommendation.created_at.desc())
+        .first()
+    )
+
+    db.close()
+
     return {
         "user_id": str(current_user.id),
         "email": current_user.email,
         "name": current_user.name,
         "avatar_url": getattr(current_user, "avatar_url", None),
         "provider": getattr(current_user, "provider", "google"),
-        "created_at": current_user.created_at
-        }
+        "created_at": current_user.created_at,
+
+        # 🔥 NEW FIELD
+        "latest_diet_plan": {
+            "diet_type": latest_diet.diet_type,
+            "foods_to_prefer_breakfast": latest_diet.foods_to_prefer_breakfast,
+            "foods_to_prefer_lunch": latest_diet.foods_to_prefer_lunch,
+            "foods_to_prefer_dinner": latest_diet.foods_to_prefer_dinner,
+            "foods_to_limit": latest_diet.foods_to_limit,
+            "tips": latest_diet.tips,
+            "note": latest_diet.note,
+            "created_at": latest_diet.created_at
+        } if latest_diet else None
+    }
